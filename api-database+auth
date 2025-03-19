@@ -1,0 +1,211 @@
+package main
+
+import (
+	"net/http"
+	"time"
+	
+	"github.com/gin-gonic/gin"
+	"github.com/dgrijalva/jwt-go"
+)
+
+var jwtKey = []byte("my_secret_key")
+
+// User structure
+type User struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Role     string `json:"role"`
+}
+
+// Credentials structure
+type Credentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// Claims structure with role
+type Claims struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	jwt.StandardClaims
+}
+
+// Predefined users
+var users = []User{
+	{Username: "admin", Password: "adminpass", Role: "admin"},
+	{Username: "user", Password: "userpass", Role: "user"},
+}
+
+type Good struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Year    int    `json:"year of production"`
+	Type    string `json:"type"`
+	Company string `json:"Company"`
+}
+
+var goods = []Good{
+	{ID: "1", Name: "iPhone 16 Pro", Year: 2024, Type: "electronic device", Company: "Apple"},
+	{ID: "2", Name: "Vacume cleaner Dyson V8", Year: 2022, Type: "appliances", Company: "Dyson"},
+	{ID: "3", Name: "macbook air 2021", Year: 2021, Type: "electronic device", Company: "Apple"},
+	{ID: "4", Name: "logitech g102", Year: 2021, Type: "PC accessories", Company: "logitech"},
+	{ID: "5", Name: "HUAWEI MatePad Pro", Year: 2025, Type: "electronic device", Company: "HUAWEI"},
+	{ID: "6", Name: "Router ADSL2+", Year: 2024, Type: "network  equipment", Company: "Mercusys"},
+}
+
+func main() {
+	router := gin.Default()
+	
+	router.POST("/login", login)
+	
+	// Public routes
+	public := router.Group("/")
+	{
+		public.GET("/goods", getGood)
+		public.GET("/goods/:id", getGoodByID)
+	}
+	
+	// Protected routes (authenticated users)
+	protected := router.Group("/")
+	protected.Use(authMiddleware())
+	{
+		protected.POST("/goods", addGood)
+		protected.PUT("/goods/:id", updateGood)
+		protected.DELETE("/goods/:id", deleteGood)
+	}
+	
+	router.Run(":8080")
+}
+
+// Auth middleware
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString := c.GetHeader("Authorization")
+		if tokenString == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+			c.Abort()
+			return
+		}
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+
+		if err != nil || !token.Valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		c.Set("username", claims.Username)
+		c.Set("role", claims.Role)
+		c.Next()
+	}
+}
+
+// Admin middleware
+func adminMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, exists := c.Get("role")
+		if !exists || role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// Login handler
+func login(c *gin.Context) {
+	var creds Credentials
+	if err := c.ShouldBindJSON(&creds); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	for _, user := range users {
+		if user.Username == creds.Username && user.Password == creds.Password {
+			token, err := generateToken(user.Username, user.Role)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"token": token})
+			return
+		}
+	}
+
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+}
+
+// Token generation
+func generateToken(username, role string) (string, error) {
+	expirationTime := time.Now().Add(24 * time.Hour)
+	claims := &Claims{
+		Username: username,
+		Role:     role,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: expirationTime.Unix(),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtKey)
+}
+
+// Остальные обработчики товаров остаются без изменений
+func getGood(c *gin.Context) {
+	c.JSON(http.StatusOK, goods)
+}
+
+func getGoodByID(c *gin.Context) {
+	id := c.Param("id")
+	for _, good := range goods {
+		if good.ID == id {
+			c.JSON(http.StatusOK, good)
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"message": "Good not found"})
+}
+
+func addGood(c *gin.Context) {
+	var newGood Good
+	if err := c.ShouldBindJSON(&newGood); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	goods = append(goods, newGood)
+	c.JSON(http.StatusCreated, newGood)
+}
+
+func updateGood(c *gin.Context) {
+	id := c.Param("id")
+	var updatedGood Good
+	if err := c.ShouldBindJSON(&updatedGood); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	for i, good := range goods {
+		if good.ID == id {
+			goods[i] = updatedGood
+			c.JSON(http.StatusOK, updatedGood)
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"message": "Good not found"})
+}
+
+func deleteGood(c *gin.Context) {
+	id := c.Param("id")
+	for i, good := range goods {
+		if good.ID == id {
+			goods = append(goods[:i], goods[i+1:]...)
+			c.JSON(http.StatusOK, gin.H{"message": "Good deleted"})
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"message": "Good not found"})
+}
