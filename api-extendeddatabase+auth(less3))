@@ -1,0 +1,231 @@
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/dgrijalva/jwt-go"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+var (
+	db      *gorm.DB
+	jwtKey  = []byte("my_secret_key")
+)
+
+// Модели данных
+type User struct {
+	gorm.Model
+	Username string `gorm:"unique;not null"`
+	Password string `gorm:"not null"`
+	Role     string `gorm:"default:'user'"`
+}
+
+type Company struct {
+	gorm.Model
+	Name        string `gorm:"unique;not null"`
+	Description string
+	Goods       []Good
+}
+
+type Good struct {
+	gorm.Model
+	Name         string `gorm:"not null"`
+	Year         int    `gorm:"not null"`
+	Type         string `gorm:"not null"`
+	CompanyID    uint   `gorm:"not null"`
+	Price        float64
+	Manufactured time.Time
+}
+
+// DTO для запросов
+type CreateGoodRequest struct {
+	Name         string    `json:"name" binding:"required"`
+	Year         int       `json:"year" binding:"required"`
+	Type         string    `json:"type" binding:"required"`
+	CompanyName  string    `json:"company" binding:"required"`
+	Price        float64   `json:"price"`
+	Manufactured time.Time `json:"manufactured"`
+}
+
+// Инициализация БД
+func initDB() {
+	dsn := "host=localhost user=postgres password=postgres dbname=goodsdb port=5432 sslmode=disable"
+	var err error
+	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		panic("failed to connect database")
+	}
+
+	// Миграции
+	db.AutoMigrate(&User{}, &Company{}, &Good{})
+}
+
+func main() {
+	initDB()
+	router := gin.Default()
+
+	router.POST("/login", login)
+	router.POST("/register", register)
+
+	// Public routes
+	public := router.Group("/api")
+	{
+		public.GET("/goods", getGoods)
+		public.GET("/goods/search", searchGoods)
+		public.GET("/goods/:id", getGoodByID)
+		public.GET("/companies", getCompanies)
+	}
+
+	// Protected routes
+	protected := router.Group("/api")
+	protected.Use(authMiddleware())
+	{
+		protected.POST("/goods", addGood)
+		protected.PUT("/goods/:id", updateGood)
+		protected.DELETE("/goods/:id", adminMiddleware(), deleteGood)
+		protected.POST("/companies", adminMiddleware(), addCompany)
+	}
+
+	router.Run(":8080")
+}
+
+// Реализация новых функций БД
+func searchGoods(c *gin.Context) {
+	query := c.Query("q")
+	company := c.Query("company")
+	minYear := c.Query("min_year")
+	maxYear := c.Query("max_year")
+
+	tx := db.Model(&Good{}).Preload("Company")
+
+	if query != "" {
+		tx = tx.Where("LOWER(name) LIKE ?", "%"+strings.ToLower(query)+"%")
+	}
+
+	if company != "" {
+		tx = tx.Joins("JOIN companies ON companies.id = goods.company_id").
+			Where("LOWER(companies.name) = ?", strings.ToLower(company))
+	}
+
+	if minYear != "" {
+		tx = tx.Where("year >= ?", minYear)
+	}
+
+	if maxYear != "" {
+		tx = tx.Where("year <= ?", maxYear)
+	}
+
+	var goods []Good
+	if err := tx.Find(&goods).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, goods)
+}
+
+// Обработчики для компаний
+func getCompanies(c *gin.Context) {
+	var companies []Company
+	if err := db.Find(&companies).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, companies)
+}
+
+func addCompany(c *gin.Context) {
+	var input struct {
+		Name        string `json:"name" binding:"required"`
+		Description string `json:"description"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	company := Company{
+		Name:        input.Name,
+		Description: input.Description,
+	}
+
+	if err := db.Create(&company).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, company)
+}
+
+// Обновленные обработчики товаров
+func getGoods(c *gin.Context) {
+	var goods []Good
+	if err := db.Preload("Company").Find(&goods).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, goods)
+}
+
+func addGood(c *gin.Context) {
+	var input CreateGoodRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Находим или создаем компанию
+	var company Company
+	db.FirstOrCreate(&company, Company{Name: input.CompanyName})
+
+	good := Good{
+		Name:         input.Name,
+		Year:         input.Year,
+		Type:         input.Type,
+		CompanyID:    company.ID,
+		Price:        input.Price,
+		Manufactured: input.Manufactured,
+	}
+
+	if err := db.Create(&good).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, good)
+}
+
+// Обновленные middleware и auth функции
+func register(c *gin.Context) {
+	var input struct {
+		Username string `json:"username" binding:"required"`
+		Password string `json:"password" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	user := User{
+		Username: input.Username,
+		Password: input.Password, // В реальном приложении нужно хеширование!
+		Role:     "user",
+	}
+
+	if err := db.Create(&user).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username already exists"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "User registered"})
+}
+
+// Остальные обработчики (updateGood, deleteGood) и middleware остаются аналогичными,
+// но с адаптацией под работу с БД через GORM
